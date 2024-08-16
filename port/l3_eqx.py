@@ -64,25 +64,27 @@ class LlamaRotaryEmbedding(eqx.Module):
     inv_freq: jnp.ndarray
     max_seq_len_cached: int
 
-    def __init__(self, dim, max_position_embeddings=8192, base=10000):
-        self.inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
-        self.max_seq_len_cached = max_position_embeddings
+    def __init__(self, config):
+        dim = config.hidden_size // config.num_attention_heads
+        self.max_seq_len_cached = config.max_position_embeddings
+        inv_freq = 1.0 / (config.rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
+        self.inv_freq = inv_freq
 
-    def __call__(self, q, k, seq_len):
-        t = jnp.arange(seq_len)
-        freqs = jnp.einsum('i,j->ij', t, self.inv_freq)
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
+    def __call__(self, x, position_ids):
+        seq_len = position_ids.shape[1]
+        t = position_ids.astype(jnp.float32)
+        inv_freq = self.inv_freq
+
+        # Reshape t to match the expected input shape
+        t = t.reshape(-1, seq_len, 1)  # Shape: (batch_size, seq_len, 1)
         
+        # Compute freqs directly without using einsum
+        freqs = t * inv_freq[None, None, :]  # Shape: (batch_size, seq_len, dim//2)
+        
+        emb = jnp.concatenate((freqs, freqs), axis=-1)  # Shape: (batch_size, seq_len, dim)
         cos = jnp.cos(emb)
         sin = jnp.sin(emb)
-        
-        q_rot = jnp.stack([-q[..., 1::2], q[..., ::2]], axis=-1).reshape(q.shape)
-        k_rot = jnp.stack([-k[..., 1::2], k[..., ::2]], axis=-1).reshape(k.shape)
-        
-        q = q * cos + q_rot * sin
-        k = k * cos + k_rot * sin
-        
-        return q, k
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 class LlamaRMSNorm(eqx.Module):
     weight: jnp.ndarray
@@ -104,47 +106,80 @@ class LlamaSdpaAttention(eqx.Module):
     o_proj: LlamaLinear
     rotary_emb: LlamaRotaryEmbedding
     num_heads: int
+    num_key_value_heads: int
+    num_key_value_groups: int
     head_dim: int
-    
-    def __init__(self, hidden_size, num_heads, num_key_value_heads, max_position_embeddings=8192):
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+    hidden_size: int
+    max_position_embeddings: int
+    rope_theta: float
+
+    def __init__(self, config):
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        self.q_proj = LlamaLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = LlamaLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = LlamaLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = LlamaLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         
-        self.q_proj = LlamaLinear(hidden_size, hidden_size, bias=False)
-        self.k_proj = LlamaLinear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = LlamaLinear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = LlamaLinear(hidden_size, hidden_size, bias=False)
-        
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings)
-    
-    def __call__(self, hidden_states, attention_mask=None, position_ids=None, key=None):
-        batch_size, seq_length, _ = hidden_states.shape
-        
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        
-        query_states = query_states.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, seq_length, self.num_heads, self.head_dim)
-        
-        query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
-        
-        # Compute attention
-        attn_weights = jnp.einsum('bqhd,bkhd->bhqk', query_states, key_states)
-        attn_weights = attn_weights / jnp.sqrt(self.head_dim)
-        
+        self.rotary_emb = LlamaRotaryEmbedding(config)
+
+    def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False, key=None):
+        bsz, q_len, _ = hidden_states.shape
+
+        query_states = self.q_proj(hidden_states).reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        key_states = self.k_proj(hidden_states).reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+        value_states = self.v_proj(hidden_states).reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        kv_seq_len = key_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # Implement caching logic here if needed
+            pass
+
+        if self.num_key_value_heads != self.num_heads:
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query_states, key_states) / jnp.sqrt(self.head_dim)
+
         if attention_mask is not None:
-            attn_weights = jnp.where(attention_mask[:, None, None, :], attn_weights, float('-inf'))
-        
+            attn_weights = jnp.where(attention_mask[:, None, None, :kv_seq_len], attn_weights, jnp.finfo(attn_weights.dtype).min)
+
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        
-        attn_output = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, value_states)
-        attn_output = attn_output.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
-        
+        attn_output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value_states)
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, q_len, self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
-        
-        return attn_output
+
+        return attn_output, None, past_key_value
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+def rotate_half(x):
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+def repeat_kv(x: jnp.ndarray, n_rep: int) -> jnp.ndarray:
+    bs, n_kv_head, seqlen, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return jnp.repeat(x[:, None, :, :, :], n_rep, axis=1).reshape(bs, n_kv_head * n_rep, seqlen, head_dim)
 
 class LlamaMLP(eqx.Module):
     gate_proj: LlamaLinear
@@ -222,7 +257,7 @@ class LlamaForCausalLM(eqx.Module):
         logits = self.lm_head(hidden_states)
         return logits
 
-# Configuration class (you might want to expand this based on your needs)
+
 class LlamaConfig:
     def __init__(self, **kwargs):
         self.vocab_size = kwargs.get("vocab_size", 32000)
@@ -233,3 +268,34 @@ class LlamaConfig:
         self.num_key_value_heads = kwargs.get("num_key_value_heads", 32)
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 2048)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        
+        # New attributes
+        self.rope_theta = kwargs.get("rope_theta", 10000.0)
+        self.attention_bias = kwargs.get("attention_bias", False)
+        self.hidden_act = kwargs.get("hidden_act", "silu")
+        self.initializer_range = kwargs.get("initializer_range", 0.02)
+        self.use_cache = kwargs.get("use_cache", True)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", False)
+        self.rope_scaling = kwargs.get("rope_scaling", None)
+        
+        # Derived attributes
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.pretraining_tp = kwargs.get("pretraining_tp", 1)
+        
+        # Optional attributes
+        self.bias = kwargs.get("bias", False)  # For compatibility with some attention implementations
+        self.rope_type = kwargs.get("rope_type", "default")
+        self.partial_rotary_factor = kwargs.get("partial_rotary_factor", 1.0)
+        
+        # Dropout rates (usually 0.0 for inference)
+        self.attention_dropout = kwargs.get("attention_dropout", 0.0)
+        self.hidden_dropout = kwargs.get("hidden_dropout", 0.0)
+        
+        # Additional optional parameters
+        self.bos_token_id = kwargs.get("bos_token_id", None)
+        self.eos_token_id = kwargs.get("eos_token_id", None)
+        self.pad_token_id = kwargs.get("pad_token_id", None)
+        self.torch_dtype = kwargs.get("torch_dtype", None)
+        
+    def __repr__(self):
+        return f"LlamaConfig({', '.join(f'{k}={v}' for k, v in self.__dict__.items())})"
