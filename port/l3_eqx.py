@@ -136,7 +136,7 @@ class LlamaSdpaAttention(eqx.Module):
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
 
-    def __call__(self, x, position_ids):
+    def __call__(self, x, position_ids, attention_mask=None):
         def jax_apply_rotary_pos_emb(q, k, cos, sin):
             q_embed = (q * cos) + (jax_rotate_half(q) * sin)
             k_embed = (k * cos) + (jax_rotate_half(k) * sin)
@@ -167,11 +167,21 @@ class LlamaSdpaAttention(eqx.Module):
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", query_states, key_states) / jnp.sqrt(self.head_dim)
 
         # Create causal mask
+        q_len, k_len = query_states.shape[2], key_states.shape[2]
         causal_mask = jnp.tril(jnp.ones((q_len, q_len)))
         causal_mask = causal_mask[None, None, :, :]
-        
-        # Apply causal mask
-        attn_weights = jnp.where(causal_mask == 0, float('-inf'), attn_weights)
+
+        # If attention_mask is provided, use it to override the causal mask
+        if attention_mask is not None:
+            # Broadcast attention_mask to the correct shape
+            attention_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
+            # Combine causal_mask and attention_mask
+            combined_mask = jnp.minimum(causal_mask, attention_mask)
+        else:
+            combined_mask = causal_mask
+
+        # Apply the combined mask
+        attn_weights = jnp.where(combined_mask == 0, float('-inf'), attn_weights)
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 
@@ -210,7 +220,7 @@ class LlamaDecoderLayer(eqx.Module):
     def __call__(self, hidden_states, attention_mask=None, position_ids=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask, position_ids)
+        hidden_states = self.self_attn(hidden_states, position_ids, attention_mask)
         hidden_states = residual + hidden_states
         
         residual = hidden_states
