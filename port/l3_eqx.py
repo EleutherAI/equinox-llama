@@ -202,12 +202,7 @@ class LlamaDecoderLayer(eqx.Module):
     post_attention_layernorm: LlamaRMSNorm
     
     def __init__(self, config):
-        self.self_attn = LlamaSdpaAttention(
-            config.hidden_size, 
-            config.num_attention_heads, 
-            config.num_key_value_heads, 
-            config.max_position_embeddings
-        )
+        self.self_attn = LlamaSdpaAttention(config)
         self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps)
