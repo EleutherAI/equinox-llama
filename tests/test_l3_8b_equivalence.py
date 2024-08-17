@@ -1,5 +1,5 @@
 """
-test_llama_equivalence.py
+test_l3_8b_equivalence.py
 
 This script serves as a comprehensive test suite for validating the equivalence
 between the original PyTorch implementation of the Llama model and its JAX/Equinox
