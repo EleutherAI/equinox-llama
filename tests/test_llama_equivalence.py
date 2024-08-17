@@ -393,9 +393,15 @@ def test_llama_attention(hf_model, eqx_config):
             value_states = jnp.repeat(value_states, params.num_heads // params.num_key_value_heads, axis=1)
         intermediates['repeat_kv'] = (key_states, value_states)
 
-        # Correct the einsum operation and shape
         attn_weights = jnp.einsum("bhqd,bhkd->bhqk", query_states, key_states) / jnp.sqrt(params.head_dim)
         intermediates['attn_weights'] = (attn_weights,)
+
+        # Create causal mask
+        causal_mask = jnp.tril(jnp.ones((q_len, q_len)))
+        causal_mask = causal_mask[None, None, :, :]
+        
+        # Apply causal mask
+        attn_weights = jnp.where(causal_mask == 0, float('-inf'), attn_weights)
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         intermediates['softmax'] = (attn_weights,)
@@ -410,6 +416,7 @@ def test_llama_attention(hf_model, eqx_config):
         intermediates['final_output'] = (attn_output,)
         
         return attn_output, intermediates
+
 
     # Call the function directly without JIT
     eqx_output, eqx_intermediates = eqx_attention_with_intermediates(eqx_attn, x, position_ids)

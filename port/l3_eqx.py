@@ -135,51 +135,52 @@ class LlamaSdpaAttention(eqx.Module):
         
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
-    def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False, key=None):
-        bsz, q_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states).reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        key_states = self.k_proj(hidden_states).reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        value_states = self.v_proj(hidden_states).reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+    def __call__(self, x, position_ids):
+        def jax_apply_rotary_pos_emb(q, k, cos, sin):
+            q_embed = (q * cos) + (jax_rotate_half(q) * sin)
+            k_embed = (k * cos) + (jax_rotate_half(k) * sin)
+            return q_embed, k_embed
 
-        kv_seq_len = key_states.shape[-2]
+        def jax_rotate_half(x):
+            x1, x2 = jnp.split(x, 2, axis=-1)
+            return jnp.concatenate((-x2, x1), axis=-1)
+        
+        bsz, q_len, _ = x.shape
+        
+        query_states = self.q_proj(x)
+        key_states = self.k_proj(x)
+        value_states = self.v_proj(x)
+        
+        query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+        value_states = value_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+        
         cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # Implement caching logic here if needed
-            pass
-
+        
+        query_states, key_states = jax_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
         if self.num_key_value_heads != self.num_heads:
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            key_states = jnp.repeat(key_states, self.num_heads // self.num_key_value_heads, axis=1)
+            value_states = jnp.repeat(value_states, self.num_heads // self.num_key_value_heads, axis=1)
 
-        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query_states, key_states) / jnp.sqrt(self.head_dim)
+        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", query_states, key_states) / jnp.sqrt(self.head_dim)
 
-        if attention_mask is not None:
-            attn_weights = jnp.where(attention_mask[:, None, None, :kv_seq_len], attn_weights, jnp.finfo(attn_weights.dtype).min)
+        # Create causal mask
+        causal_mask = jnp.tril(jnp.ones((q_len, q_len)))
+        causal_mask = causal_mask[None, None, :, :]
+        
+        # Apply causal mask
+        attn_weights = jnp.where(causal_mask == 0, float('-inf'), attn_weights)
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value_states)
+
+        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, value_states)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, q_len, self.num_heads * self.head_dim)
+        
         attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-def rotate_half(x):
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-def repeat_kv(x: jnp.ndarray, n_rep: int) -> jnp.ndarray:
-    bs, n_kv_head, seqlen, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return jnp.repeat(x[:, None, :, :, :], n_rep, axis=1).reshape(bs, n_kv_head * n_rep, seqlen, head_dim)
+        
+        return attn_output
 
 class LlamaMLP(eqx.Module):
     gate_proj: LlamaLinear
